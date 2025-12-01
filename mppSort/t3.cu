@@ -1,0 +1,476 @@
+/**
+ * @brief Implementação de mppSort em CUDA.
+ * @author Luiz Henrique Murback Wiedmer
+ * @author Eduardo Giehl
+ */
+
+// C
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <chrono>
+#include <limits>
+#include <vector>
+
+// CUDA e thrust
+// CUDA e thrust
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/reduce.h>
+#include <thrust/functional.h>
+#include <thrust/execution_policy.h>
+
+#define SHARED_SIZE_LIMIT 8192
+
+#ifndef THREADS_PER_BLOCK
+#define THREADS_PER_BLOCK 1024
+#endif 
+
+// --- Macro de verificação de erro CUDA ---
+static void HandleError( cudaError_t err, const char *file, int line ) {
+    if (err != cudaSuccess) {
+        printf( "%s in %s at line %d\n", cudaGetErrorString( err ),
+                file, line );
+        exit( EXIT_FAILURE );
+    }
+}
+#define CUDA_CHECK( err ) (HandleError( err, __FILE__, __LINE__ ))
+
+
+
+__global__ void blockAndGlobalHisto(unsigned int *hh, unsigned int *hg,
+    unsigned int h, unsigned int *input, long long int nE, unsigned int min,
+    unsigned int max) {
+    extern __shared__ unsigned int shared_mem[];
+
+    unsigned int *histo = shared_mem;
+    //Incializa o vetor histo com 0
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+        histo[i] = 0;
+    }
+    unsigned int tamFaixa = (max - min + h) / h; //Calcula o teto do numero de possiveis valores sobre o numero de faixas
+    unsigned int start = blockIdx.x * blockDim.x;
+    unsigned int d = gridDim.x * blockDim.x;
+    unsigned int ig;
+    __syncthreads();
+    //Preenche o histograma local
+    while (start < nE) {
+        ig = start + threadIdx.x;
+        if (ig < nE) {
+            unsigned int aux = input[ig];
+            unsigned int bin_idx = (aux - min) / tamFaixa; //Ao invés de procurar pela faixa, calcular ela diretamente
+            atomicAdd(histo + bin_idx, 1);
+        }
+        __syncthreads();
+        start += d;
+    }
+    __syncthreads();
+    //Copia o histograma local do bloco para a linha corespondente de hh
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+        hh[i + blockIdx.x * h] = histo[i];
+    }
+    //Calcula o histograma global hg
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+        atomicAdd(hg + i, histo[i]);
+    }
+}
+
+//Dispara 1 bloco com h threads e aloca um vetor de tamanho h na shared memory
+__global__ void GlobalHistoScan(unsigned int *hg, unsigned int *shg, unsigned int h,
+                                unsigned int pot){
+    extern __shared__ unsigned int XY[];
+    if (threadIdx.x < h) {
+        XY[threadIdx.x] = hg[threadIdx.x];
+    } else if (threadIdx.x < pot) {
+        XY[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    for (unsigned int stride = 1;stride <= pot/2; stride = stride * 2) {
+        int index = (threadIdx.x+1)*stride*2 - 1;
+        if(index < pot)
+            XY[index] += XY[index-stride];
+        __syncthreads();
+    }
+    for (unsigned int stride = pot/2; stride > 0; stride = stride / 2) {
+        __syncthreads();
+        int index = (threadIdx.x+1)*stride*2 - 1;
+        if(index+stride < pot)
+            XY[index + stride] += XY[index];
+    }
+    __syncthreads();
+    if (threadIdx.x < h) {
+        if (!threadIdx.x) {
+            shg[threadIdx.x] = 0;
+        } else {
+            shg[threadIdx.x] = XY[threadIdx.x - 1];
+        }
+    }
+}
+
+//Dispara h blocos com lin threads e aloca um vetor de tamanho lin em shared memory
+__global__ void verticalScanHH(unsigned int *hh, unsigned int *psv, unsigned int h, unsigned int lin){
+    extern __shared__ unsigned int XY[];
+    unsigned int ig = blockIdx.x + threadIdx.x * h;
+    unsigned long long int nE = lin * h;
+    if (ig < nE)
+        XY[threadIdx.x] = hh[ig];
+    __syncthreads();
+    unsigned int numThreads = (lin+1) >> 1;
+    for (unsigned int stride = 1;stride <= numThreads; stride = stride * 2) {
+        int index = (threadIdx.x+1)*stride*2 - 1;
+        if(index < lin)
+            XY[index] += XY[index-stride];
+        __syncthreads();
+    }
+    for (unsigned int stride = (numThreads+1) >> 1; stride > 0; stride = stride / 2) {
+        __syncthreads();
+        int index = (threadIdx.x+1)*stride*2 - 1;
+        if(index+stride < lin)
+            XY[index + stride] += XY[index];
+    }
+    __syncthreads();
+    if (ig < nE) {
+        if (!threadIdx.x) {
+            psv[ig] = 0;
+        } else {
+            psv[ig] = XY[threadIdx.x - 1];
+        }
+    }
+}
+
+__global__ void partitionKernel(unsigned int *hh, unsigned int *shg, unsigned int *psv,
+                                unsigned int h, unsigned int *input, unsigned int *output,
+                                unsigned long long int nE, unsigned int nMin, unsigned int nMax) {  
+    extern __shared__ unsigned int shared_mem[];
+
+    unsigned int *hlsh = shared_mem;    
+    for (int i = threadIdx.x; i < h; i += blockDim.x) {
+        hlsh[i] = shg[i] + psv[i + blockIdx.x * h];
+    }
+    unsigned int tamFaixa = (nMax - nMin + h) / h; //Calcula o teto do numero de possiveis valores sobre o numero de faixas
+    unsigned int start = blockIdx.x * blockDim.x;
+    unsigned int d = gridDim.x * blockDim.x;
+    unsigned int ig;
+    __syncthreads();
+    while (start < nE) {
+        ig = start + threadIdx.x;
+        if (ig < nE) {
+            unsigned int aux = input[ig];
+            unsigned int bin_idx = (aux - nMin) / tamFaixa; //Ao invés de procurar pela faixa, calcular ela diretamente
+            output[atomicAdd(hlsh + bin_idx, 1)] = aux;
+        }
+        start += d;
+    }
+}
+
+
+__device__ inline void Comparator(uint &keyA, uint &keyB, uint dir) {
+  uint t;
+
+  if ((keyA > keyB) == dir) {
+    t = keyA;
+    keyA = keyB;
+    keyB = t;
+  }
+}
+
+
+__device__ inline unsigned int nextPot(unsigned int a) {
+    if (a <= 1) return 1;
+    return 1 << (32 - __clz(a - 1));
+}
+
+__global__ void segmentedBitonicSort(unsigned int *d_Key, 
+                                     unsigned int *d_Offsets, 
+                                     unsigned int *d_Sizes, 
+                                     unsigned int num_segments, 
+                                     unsigned int dir ) { 
+    extern __shared__ unsigned int s_key[]; 
+     
+
+    unsigned int offset = d_Offsets[blockIdx.x]; 
+    unsigned int size = d_Sizes[blockIdx.x]; 
+    unsigned int paddedSize = nextPot(size); 
+
+
+    for (unsigned int i = threadIdx.x; i < paddedSize; i += blockDim.x) {
+        if (i < size) {
+            s_key[i] = d_Key[offset + i]; 
+        } else {
+            s_key[i] = UINT32_MAX;
+        }
+    }
+    
+    __syncthreads(); 
+    for (unsigned int s = 2; s <= paddedSize; s <<= 1) { 
+        for (unsigned int stride = s / 2; stride > 0; stride >>= 1) { 
+            __syncthreads(); 
+            for (unsigned int k = threadIdx.x; k < paddedSize / 2; k += blockDim.x) { 
+                unsigned int ddd = dir ^ ((k & (s / 2)) != 0);
+                unsigned int pos = 2 * k - (k & (stride - 1)); 
+                Comparator(s_key[pos + 0], s_key[pos + stride], ddd); 
+            }
+        } 
+    } 
+
+    for (unsigned int stride = paddedSize / 2; stride > 0; stride >>= 1) { 
+        __syncthreads(); 
+        for (unsigned int k = threadIdx.x; k < paddedSize / 2; k += blockDim.x) {
+            unsigned int pos = 2 * k - (k & (stride - 1)); 
+            Comparator(s_key[pos + 0], s_key[pos + stride], dir); 
+        }
+    }
+
+    __syncthreads(); 
+    for (unsigned int i = threadIdx.x; i < size; i += blockDim.x) {
+        d_Key[offset + i] = s_key[i];
+    }
+}
+
+
+unsigned int proximaPotenciaDe2_Limite1024(unsigned int a) {
+    if (a <= 1) return 1;
+    return 1 << (32 - __builtin_clz(a - 1));
+}
+
+bool verifySort(unsigned int* h_mppSorted, unsigned int* h_thrustSorted, long long n) {
+    for(long long i = 0; i < n; i++) {
+        if(h_mppSorted[i] != h_thrustSorted[i]) {
+            fprintf(stderr, "ERRO de Verificacao no indice %lld!\n", i);
+            fprintf(stderr, "  Esperado (thrust): %u\n", h_thrustSorted[i]);
+            fprintf(stderr, "  Obtido (mppSort): %u\n", h_mppSorted[i]);
+            // Imprime alguns valores ao redor do erro
+            for (long long j = std::max(0LL, i - 5); j < std::min(n, i + 5); j++) {
+                fprintf(stderr, "    idx %lld: mpp=%u, thrust=%u %s\n",
+                    j, h_mppSorted[j], h_thrustSorted[j], (j==i) ? "<- ERRO" : "");
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+void printCorrectUse() {
+    printf("Uso correto eh:\n"
+           "./mppSort <nTotalElements> <h> <hr>\n");
+}
+
+int main (int argc, char** argv) {
+    if (argc != 4) {
+        printCorrectUse();
+        exit(1);
+    }
+
+    auto medir_kernel = [&](auto&& launch) {
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        launch();  // aqui você chama o kernel
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        return ms;
+    };
+
+    long long nTotal = atoll(argv[1]);
+    long long h = atoll(argv[2]);
+    int nR = atoi(argv[3]);
+
+    // Por conta do tamanho dos histogramas
+    if (h > THREADS_PER_BLOCK) {
+        printf("h não pode ser maior que %d\n", THREADS_PER_BLOCK);
+        exit(1);
+    }
+
+    printf("Configuracao do Teste:\n");
+    printf(" - Numero de Repeticoes (nR): %d\n", nR);
+    printf(" - Tamanho do Buffer: %lld elementos \n", nTotal);
+    printf(" - Numero de Particoes (h): %lld\n", h);
+    printf("--------------------------------------------------------\n");
+
+    //Vetor principal alocado
+    std::vector<unsigned int> input(nTotal);
+    std::vector<unsigned int> outputThrust(nTotal);
+    std::vector<unsigned int> outputKernel(nTotal);
+
+
+    srand(time(NULL));
+    unsigned int nMax;
+    unsigned int nMin;
+    for (size_t i = 0; i < nTotal; i++) {
+        unsigned int a = rand();
+        unsigned int b = rand();
+
+        unsigned int v = a;
+        if (i == 0) {
+            nMax = v;
+            nMin = v;
+        } else if (v < nMin) {
+            nMin = v;
+        } else if (v > nMax) {
+            nMax = v;
+        }
+        //printf("%d ", v);
+        input[i] = v;
+    }
+    //printf("\n");
+    unsigned int L = (nMax - nMin + h) / h;
+
+
+    printf("Intervalo de dados [nMin, nMax]: [%u, %u]\n", nMin, nMax);
+    printf("Largura da Faixa (L): %u\n", L);
+    printf("--------------------------------------------------------\n");
+    
+
+        // --- 2. Alocação de Memória (Device) ---
+    unsigned int *d_Input, *d_Output, *d_Thrust;
+    unsigned int *d_HH, *d_Hg, *d_SHg, *d_PSv;
+
+    // Parâmetros dos kernels
+    // Kernel 1 & 4
+    int nb = 128;  // Número de bloco
+
+
+
+    printf("Alocando memoria na GPU...\n");
+    CUDA_CHECK(cudaMalloc(&d_Input, nTotal * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_Output, nTotal * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_Thrust, nTotal * sizeof(int)));
+    
+    // --- 3. Cópia Host -> Device ---
+    printf("Copiando dados para a GPU...\n");
+    CUDA_CHECK(cudaMemcpy(d_Input, input.data(), nTotal * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Thrust, input.data(), nTotal * sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    
+    // Matriz HH: nb linhas, h colunas
+    CUDA_CHECK(cudaMalloc(&d_HH, nb * h * sizeof(unsigned int)));
+    // Vetor Hg: h elementos
+    CUDA_CHECK(cudaMalloc(&d_Hg, h * sizeof(unsigned int)));
+    // Vetor SHg: h elementos
+    CUDA_CHECK(cudaMalloc(&d_SHg, h * sizeof(unsigned int)));
+    // Matriz PSv: nb linhas, h colunas
+    CUDA_CHECK(cudaMalloc(&d_PSv, nb * h * sizeof(unsigned int)));
+
+    // --- 4. Execução dos Kernels ---
+    printf("Executando kernels (%d repeticoes)...\n", nR);
+
+    double totalTime1 = 0.0;
+
+    size_t sharedMemK1 = 2 * h * sizeof(unsigned int);
+
+    for (int i = 0; i < nR; i++) {
+        CUDA_CHECK(cudaMemset(d_HH, 0, nb * h * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(d_Hg, 0, h * sizeof(unsigned int)));
+        
+        totalTime1 += medir_kernel([&] {
+            blockAndGlobalHisto<<<nb, THREADS_PER_BLOCK, sharedMemK1>>>(d_HH, d_Hg, h, d_Input, nTotal, nMin, nMax);
+        });
+    }
+
+    double avg1 = totalTime1/nR;
+
+    double totalTime2 = 0.0;
+
+    unsigned int pot  = proximaPotenciaDe2_Limite1024(h);
+    size_t sharedMemK2 = pot * sizeof(unsigned int);
+
+    for (int i = 0; i < nR; i++) {
+        
+        totalTime1 += medir_kernel([&] {
+            GlobalHistoScan<<<1, pot, sharedMemK2>>>(d_Hg, d_SHg, h, pot);
+        });
+    }
+
+    double avg2 = totalTime2/nR;
+
+
+    double totalTime3 = 0.0;
+
+    size_t sharedMemK3 = nb * sizeof(unsigned int);
+    for (int i = 0; i < nR; i++) {
+        
+        totalTime3 += medir_kernel([&] {
+            verticalScanHH<<<h, nb, sharedMemK3>>>(d_HH, d_PSv, h, nb);
+        });
+
+    }
+
+    double avg3 = totalTime3/nR;
+
+    double totalTime4 = 0.0;
+
+    size_t sharedMemK4 = h * 2 * sizeof(unsigned int);
+    for (int i = 0; i < nR; i++) {
+
+        totalTime4 += medir_kernel([&] {
+            partitionKernel<<<nb,THREADS_PER_BLOCK,sharedMemK4>>>( d_HH, d_SHg, d_PSv, h, d_Input, d_Output, nTotal, nMin, nMax );
+        });
+    }
+
+    double avg4 = totalTime4/nR;
+
+
+    std::vector<unsigned int> h_Hg(h);
+    std::vector<unsigned int> h_SHg(h);
+    CUDA_CHECK(cudaMemcpy(h_Hg.data(), d_Hg, h * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_SHg.data(), d_SHg, h * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+    unsigned int* d_Output_backup;
+    CUDA_CHECK(cudaMalloc(&d_Output_backup, nTotal * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_Output_backup, d_Output, nTotal * sizeof(unsigned int), cudaMemcpyDeviceToDevice));
+
+    double totalTime5 = 0.0;
+    for (int r = 0; r < nR; r++) {
+        CUDA_CHECK(cudaMemcpy(d_Output, d_Output_backup, nTotal * sizeof(unsigned int), cudaMemcpyDeviceToDevice));
+        unsigned int size = sizeof(unsigned int) * SHARED_SIZE_LIMIT;
+        totalTime5 += medir_kernel([&] {
+            segmentedBitonicSort<<<h, THREADS_PER_BLOCK, size>>>(d_Output, d_SHg, d_Hg, h, 1);
+        });
+    }
+    double avg5 = totalTime5/nR;
+
+    double tempoTotal = avg1 + avg2 + avg3 + avg4 + avg5;
+
+
+    double totalTime_thrust_accum = 0.0;
+    for(int r = 0; r < nR; r++) {
+        CUDA_CHECK(cudaMemcpy(d_Thrust, input.data(), nTotal * sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+        totalTime_thrust_accum += medir_kernel([&] {
+            thrust::sort(thrust::device, d_Thrust, d_Thrust + nTotal);
+        });
+    }
+    double avg_thrust = totalTime_thrust_accum / nR;
+
+
+    CUDA_CHECK(cudaMemcpy(outputThrust.data(), d_Thrust, nTotal * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(outputKernel.data(), d_Output, nTotal * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    
+    if (verifySort(outputKernel.data(), outputThrust.data(), nTotal)) {
+        printf("O vetor foi ordenado corretamente\n");
+    } else {
+        printf("O vetor foi ordenado incorretamente\n");
+    }
+    
+
+    printf("Tempo blockAndGlobalHisto: %.6fs\n", avg1/1000);
+    printf("Tempo GlobalHistoScan: %.6fs\n", avg2/1000);
+    printf("Tempo verticalScanHH: %.6fs\n", avg3/1000);
+    printf("Tempo partitionKernel: %.6fs\n", avg4/1000);
+    printf("Tempo ordenacao: %.6fs\n", avg5/1000);
+    printf("Tempo total: %.6fs\n", tempoTotal/1000);
+    printf("Tempo thrust: %.6fs\n", avg_thrust/1000);
+    printf("Vazão mpp: %.6fGEle/s\n", (nTotal/1000000.0)/tempoTotal);
+    printf("Vazão thrust: %.6fGEle/s\n", (nTotal/1000000.0)/avg_thrust);
+    printf("Speedup: %.6f\n", avg_thrust/tempoTotal);
+
+}
